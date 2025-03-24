@@ -1,112 +1,160 @@
-'''
-Notes from the paper 
-
-Use a fixed size window i.e a fixed number of days of historic data before a prediction is made 
-Use the KL-Divergence to measure the similarity between the distributions 'p' and 'q' 
-'''
-
-
 import torch
 from torch import nn 
 import math
 
+
+SEQUENCE_LENGTH = 24
+
 class Probsparse_Attention_Head(nn.Module):
-	def __init__(self, q_dim, kv_dim, d_model, c, share_kv=False):
-		super().__init__()
-		self.q_dim = q_dim 
-		self.kv_dim = kv_dim 
-		self.d_model = d_model
-		# Using notation from the paper (:TODO figure out what exactly 'c' is)
-		self.c = c 
-		self.share_kv = share_kv
-		
-		# Initializing the query, key and value vectors with the shape (L, d_model)
-		self.queries = nn.Linear(self.q_dim, self.d_model) 
-		self.keys = nn.Linear(self.kv_dim, self.d_model) 
-		self.values = nn.Linear(self.kv_dim, self.d_model) 
+    def __init__(self, q_dim, kv_dim, d_model, c, share_kv=False, mask=None):
+        super().__init__()
+        self.q_dim = q_dim 
+        self.kv_dim = kv_dim 
+        self.d_model = d_model
+        # Using notation from the paper (sampling factor ideally set to 5 in the paper) 
+        self.c = c 
+        self.share_kv = share_kv
+        self.mask = mask
+    
+        self.register_buffer('tril', torch.tril(torch.ones(SEQUENCE_LENGTH, SEQUENCE_LENGTH))) 
 
-	def _sampler(self, k):
-		'''
-		k is the forwarded versions of the linear layers defined above in the class
-		'''
-		u = self.c * math.log(self.q_dim)
-		U = int(self.q_dim * math.log(self.kv_dim))
-		
-		# Randomly selecting 'U' dot-product pairs from self.keys as k_bar
-		index_sample = torch.randint(0, self.kv_dim, (U,))
-		k_bar = k[:, index_sample, :]
-		return k_bar, u
+    def _sampler(self, k):
+        '''
+        k is the forwarded versions of the linear layers defined above in the class
+        Shape: (batch_size, kv_dim, d_model)
+        '''
+        batch_size = k.shape[0]
+        u = int(self.c * math.log(self.q_dim))
+        U = int(self.q_dim * math.log(self.kv_dim))
+        
+        # Randomly selecting 'U' dot-product pairs from keys for each batch
+        k_bar_list = []
+        for b in range(batch_size):
+            # Select random indices for each batch
+            index_sample = torch.randint(0, self.kv_dim, (U,))
+            k_bar_list.append(k[b, index_sample, :])
+        
+        k_bar = torch.stack(k_bar_list)
+        return k_bar, u
 
-	def forward(self, x):
-		q = self.queries(x)
-		k = self.keys(x)
-		v = self.values(x)
-		
-		# Getting the sample score S_bar 
-		k_bar, u = self._sampler(k)
-		s_bar = torch.matmul(q, k_bar.transpose(1, 0))
-		
-		# Computing the 'M' value 
-		M = torch.max(s_bar, 1).values - torch.mean(s_bar, 1)
-		
-		# Top-k sampling of the queries 
-		top_u_indices = torch.topk(M, u, sorted=False)[1]
-		q_bar = q[top_u_indices]
-		
-		# Performing attention computation (:TODO masking not implemented) 
-		attn_weights = q_bar @ k.transpose(1, 0)
-		attn_weights = torch.softmax(attn_weights, dim=-1)
-		s_1 = atnn_weights @ v
-		s_0 = torch.mean(v, dim=0).unsqueeze(0)
-		s_0 = s_0.expand(q_bar.shape[0], -1)
+    def forward(self, q, k, v):
+        batch_size = q.shape[0]
+        
+        # Getting the sample score S_bar 
+        k_bar, u = self._sampler(k)  
+    
+        s_bar = torch.bmm(q, k_bar.transpose(1, 2))
+        M = torch.max(s_bar, 2).values - torch.mean(s_bar, 2)  # Shape: (batch_size, q_dim)
+        
+        # Initialize output with zeros
+        s = torch.zeros_like(q) 
 
-		s = torch.zeros_like(q)  # Initialize output with zeros
-		s[top_u_indices] = s_1  # Place S1 in the corresponding positions
-		remaining_indices = torch.tensor([i for i in range(q.shape[0]) if i not in top_u_indices])
-		s[remaining_indices] = s_0  # Place S0 for remaining rows
+        for b in range(batch_size):
+            # Top-u sampling of the queries for each batch
+            top_u_indices = torch.topk(M[b], u, sorted=False)[1]
+            q_bar = q[b, top_u_indices, :]  # Shape: (u, d_model)
+            
+            # Performing attention computation
+            attn_weights = (q_bar @ k[b].transpose(0, 1)) / (k[b].shape[0] ** 0.5)
+            attn_weights = torch.softmax(attn_weights, dim=-1)
 
-		return s if not self.share_kv else s, k, v
+            s_1 = attn_weights @ v[b]
+            
+            # Place S1 in the corresponding positions
+            s[b, top_u_indices, :] = s_1
+            
+            # Get indices not in top_u
+            all_indices = torch.arange(q.shape[1], device=q.device)
+            mask = torch.ones(q.shape[1], dtype=torch.bool, device=q.device)
+            mask[top_u_indices] = False
+            remaining_indices = all_indices[mask]
+            
+            # Compute S0 (mean of values) for remaining positions
+            s_0 = torch.mean(v[b], dim=0, keepdim=True)  # Shape: (1, d_model)
+            s_0 = s_0.expand(len(remaining_indices), -1)  # Shape: (remaining_count, d_model)
+            s[b, remaining_indices, :] = s_0
+        
+        return s if not self.share_kv else (s, k, v)
 
 
 class Self_Attention_Head(nn.Module):
-	def __init__(self, q_dim, kv_dim, d_model, receive_kv=False):
-		super().__init__()
-		self.q_dim = q_dim 
-		self.kv_dim = kv_dim 
-		self.d_model = d_model
-		self.receive_kv = receive_kv
-		
-		self.queries = nn.Linear(self.q_dim, self.d_model)
-		self.keys = nn.Linear(self.kv_dim, self.d_model) 
-		self.values = nn.Linear(self.kv_dim, self.d_model)
+    def __init__(self, q_dim, kv_dim, d_model, receive_kv=False):
+        super().__init__()
+        self.q_dim = q_dim 
+        self.kv_dim = kv_dim 
+        self.d_model = d_model
+        self.receive_kv = receive_kv
+        
+        self.queries = nn.Linear(self.q_dim, self.d_model)
+        self.keys = nn.Linear(self.kv_dim, self.d_model) 
+        self.values = nn.Linear(self.kv_dim, self.d_model)
 
-	def forward(self, x, k=None, v=None):
-		q = self.queries(x)
-		if not self.receive_kv:
-			k = self.keys(x)
-			v = self.values(x)
-		attn_weights = q @ k.transpose(1, 0)
-		attn_weights = torch.softmax(attn_weights, dim=-1)
-		attn_scores = attn_weights @ v
-		return attn_scores
-			
+    def forward(self, x, k=None, v=None):
+        # x: (batch_size, seq_len, q_dim)
+        batch_size, seq_len = x.shape[0], x.shape[1]
+        
+        q = self.queries(x)  # (batch_size, seq_len, d_model)
+        if not self.receive_kv:
+            k = self.keys(x)  
+            v = self.values(x) 
+        
+        attn_weights = torch.bmm(q, k.transpose(1, 2)) / (k.shape[1] ** 0.5)
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        
+        attn_scores = torch.bmm(attn_weights, v)
+        
+        return attn_scores
 
 
 class MultiHead_Attention(nn.Module):
-	def __init__(self, n_heads, d_model, head_type, q_dim, kv_dim, receive_kv=False, c, share_kv=False):
-		super().__init__()
-		self.n_heads = n_heads 
-		self.d_model = d_model 
-		self.head_type = head_type	# Can be Self_Attention_Head or Prob_Sparse_Attention_Head
-		self.head_size = self.d_model // self.n_heads
-		self.q_dim = q_dim 
-		self.kv_dim = kv_dim 	
-		self.receive_kv = receive_kv
-		self.c = c 
-		self.share_kv = share_kv
+    def __init__ (self, n_heads, d_model, head_type, q_dim, kv_dim, c, receive_kv=False, share_kv=False):
+        super().__init__()
+        self.n_heads = n_heads 
+        self.d_model = d_model 
+        self.head_type = head_type    # Can be Self_Attention_Head or Prob_Sparse_Attention_Head
+        self.head_size = self.d_model // self.n_heads
+        self.q_dim = q_dim 
+        self.kv_dim = kv_dim 
+        self.receive_kv = receive_kv
+        self.c = c 
+        self.share_kv = share_kv
 
-		self.projection = nn.Linear(self.num_heads * self.head_size, sself.d_model)
-		if self.head_type == "sa":
-			self.heads = nn.ModuleList([Self_Attention_Head(self.q_dim, self.kv_dim, self.d_model, self.receive_kv) for _ in range(self.n_heads)])
-		else:
-			self.heads = nn.ModuleList([Probsparse_Attention_Head(self.q_dim, self.kv_dim, self.d_model, self.c, self.share_kv) for _ in range(self.n_heads)])
+        # Initialize either the self attention or the prob-sparse attention 
+        if self.head_type == "sa":
+            # Getting the 'x' 
+            self.heads = nn.ModuleList([Self_Attention_Head(self.q_dim, self.kv_dim, self.head_size, self.receive_kv) for _ in range(self.n_heads)])
+        else:
+            self.heads = nn.ModuleList([Probsparse_Attention_Head(self.q_dim, self.kv_dim, self.head_size, self.c, self.share_kv) for _ in range(self.n_heads)])
+
+        self.projection = nn.Linear(self.n_heads * self.head_size, self.d_model)
+
+    def forward(self, *args):
+        # Conditions to be checked for 
+        '''
+        1. Self attention layer Normal 
+        2. Self attention layer receive kv 
+        3. Prob-Sparse layer Normal 
+        4. Prob-Sparse layer share kv
+        '''
+        attn_out = None
+        if self.head_type == "sa" and not self.receive_kv:
+            x = args[0]  
+            outputs = [head(x) for head in self.heads]  
+            attn_out = torch.cat(outputs, dim=-1)  
+            return self.projection(attn_out)
+        if self.head_type == "sa" and self.receive_kv:
+            x, k, v = args[0], args[1], args[2]
+            outputs = [head(x, k, v) for head in self.heads]  
+            attn_out = torch.cat(outputs, dim=-1)  
+            return self.projection(attn_out) 
+        if self.head_type != "sa" and not self.share_kv:
+            q, k, v = args[0], args[1], args[2]
+            outputs = [head(q, k, v) for head in self.heads]
+            attn_out = torch.cat(outputs, dim=-1)
+            return self.projection(attn_out)
+        if self.head_type != "sa" and self.share_kv:
+            q, k, v = args[0], args[1], args[2]
+            outputs = [head(q, k, v) for head in self.heads]
+            output_s = [outputs[i][0] for i in range(len(outputs))]
+            attn_out = torch.cat(output_s, dim=-1)  
+            return self.projection(attn_out), k, v
