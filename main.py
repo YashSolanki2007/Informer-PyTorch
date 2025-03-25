@@ -158,3 +158,45 @@ class MultiHead_Attention(nn.Module):
             output_s = [outputs[i][0] for i in range(len(outputs))]
             attn_out = torch.cat(output_s, dim=-1)  
             return self.projection(attn_out), k, v
+        
+
+
+class FeedForward(nn.Module):
+    def __init__(self, fan_in, ff_dim, fan_out):
+        super().__init__()
+        self.fan_in = fan_in
+        # As per the paper the ff_dim = 4 * fan_in
+        self.ff_dim = ff_dim 
+        self.fan_out = fan_out
+
+        self.l1 = nn.ReLU(nn.Linear(self.fan_in, self.ff_dim))
+        self.l2 = nn.Linear(self.ff_dim, self.fan_out)
+
+    def forward(self, x):   
+        return self.l2(self.l1(x))
+
+
+
+class PositionEncoding(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model 
+
+        position_embed = torch.zeros(SEQUENCE_LENGTH, self.d_model)
+        for pos in range(len(position_embed)):
+            for i in range(len(position_embed[pos])):
+                div_term = 10000 ** (2 * i / self.d_model)
+                if i % 2 == 0:
+                    position_embed[pos][i]  = math.sin(pos / div_term)
+                else:
+                    position_embed[pos][i]  = math.cos(pos / div_term)
+
+        # Persists this in model training 
+        self.register_buffer('position_embed', position_embed)
+
+    
+    def forward(self, token_embed):
+        return token_embed + self.position_embed
+    
+
+
