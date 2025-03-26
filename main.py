@@ -11,8 +11,7 @@ class Probsparse_Attention_Head(nn.Module):
         self.q_dim = q_dim 
         self.kv_dim = kv_dim 
         self.d_model = d_model
-        # Using notation from the paper (sampling factor ideally set to 5 in the paper) 
-        self.c = c 
+        self.c = c      # Using notation from the paper (sampling factor ideally set to 5 in the paper) 
         self.share_kv = share_kv
         self.mask = mask
     
@@ -56,6 +55,8 @@ class Probsparse_Attention_Head(nn.Module):
             
             # Performing attention computation
             attn_weights = (q_bar @ k[b].transpose(0, 1)) / (k[b].shape[0] ** 0.5)
+            if self.mask is not None:
+                attn_weights = attn_weights.masked_fill(self.mask == 0, float('-inf'))
             attn_weights = torch.softmax(attn_weights, dim=-1)
 
             s_1 = attn_weights @ v[b]
@@ -71,10 +72,12 @@ class Probsparse_Attention_Head(nn.Module):
             
             # Compute S0 (mean of values) for remaining positions
             s_0 = torch.mean(v[b], dim=0, keepdim=True)  # Shape: (1, d_model)
-            s_0 = s_0.expand(len(remaining_indices), -1)  # Shape: (remaining_count, d_model)
-            s[b, remaining_indices, :] = s_0
+            if len(remaining_indices) > 0:
+                s_0 = s_0.expand(len(remaining_indices), -1)    # Shape: (remaining_count, d_model)
+                s[b, remaining_indices, :] = s_0
         
         return s if not self.share_kv else (s, k, v)
+
 
 
 class Self_Attention_Head(nn.Module):
@@ -169,11 +172,12 @@ class FeedForward(nn.Module):
         self.ff_dim = ff_dim 
         self.fan_out = fan_out
 
-        self.l1 = nn.ReLU(nn.Linear(self.fan_in, self.ff_dim))
+        self.l1 = nn.Linear(self.fan_in, self.ff_dim)
+        self.a1 = nn.ReLU()
         self.l2 = nn.Linear(self.ff_dim, self.fan_out)
 
     def forward(self, x):   
-        return self.l2(self.l1(x))
+        return self.l2(self.a1(self.l1(x)))
 
 
 
@@ -200,3 +204,42 @@ class PositionEncoding(nn.Module):
     
 
 
+class InformerEncoder(nn.Module):
+    def __init__(self, input_dim, d_model, n_heads, c, n_layers=4):
+        super().__init__()
+        self.input_projection = nn.Linear(input_dim, d_model)
+        self.position_encoding = PositionEncoding(d_model)
+        self.encoder_layers = nn.ModuleList([
+            nn.ModuleList([
+                MultiHead_Attention(n_heads, d_model, "ps", d_model, d_model, c),
+                FeedForward(d_model, 4 * d_model, d_model),
+                nn.LayerNorm(d_model)
+            ]) for _ in range(n_layers)
+        ])
+        self.distilling_layers = nn.ModuleList([
+            nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1),
+            nn.ELU(),
+            nn.MaxPool1d(kernel_size=2, stride=2)
+        ])
+
+    def forward(self, x):
+        x = self.input_projection(x)
+        x = self.position_encoding(x)
+        
+        outputs = [x]  # Store intermediate outputs for concatenation
+        
+        for attn, ffn, norm in self.encoder_layers:
+            attn_out = attn(x, x, x) + x
+            attn_out = norm(attn_out)
+
+            ffn_out = ffn(attn_out) + attn_out
+            x = norm(ffn_out)
+
+            # Distilling layer (Downsampling)
+            x = x.transpose(1, 2)  # Conv1D requires (batch_size, d_model, L)
+            for layer in self.distilling_layers:
+                x = layer(x)
+            x = x.transpose(1, 2)  # Back to (batch_size, L, d_model)
+            outputs.append(x)
+
+        return torch.cat(outputs, dim=1)
